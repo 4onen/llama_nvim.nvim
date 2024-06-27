@@ -1,3 +1,6 @@
+-- Copyright © 2024 Matthew Dupree
+-- This file is part of llama_nvim
+
 local M = {}
 
 local name = "llama_nvim"
