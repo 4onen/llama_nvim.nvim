@@ -1,3 +1,32 @@
+local M = {}
+
+M.DEFAULTS = {
+    commands = {
+        start = "LlamaStart",
+        kill = "LlamaKill",
+        health = "LlamaHealth",
+    },
+    keymaps = {
+        start = "gg", -- Doubles as kill if a job is running, think "toggle"
+        kill = "G",
+    },
+    server = {
+        host = "http://localhost",
+        port = 8080,
+    },
+    is_setup = true, -- Don't change this
+}
+
+-- Metatable config setup thanks to
+-- https://hiphish.github.io/blog/2022/03/15/lua-metatables-for-neovim-plugin-settings/
+local config = {
+    is_setup = false,
+}
+
+local construct_url = function(endpoint)
+    return config.server.host .. ':' .. config.server.port .. '/' .. endpoint
+end
+
 local insert_text = function (text, win)
     -- Insert text at the current cursor position in a given window
     if not win then
@@ -24,13 +53,32 @@ end
 
 local current_jobs = {}
 
+local wrapped_err_writeln = vim.schedule_wrap(vim.api.nvim_err_writeln)
+
 local on_exit = function (win, res)
-    print("Process exited with code: ", res.code)
     current_jobs[win].finished = true
+    if res.code == 0 then
+        vim.print("Process exited successfully")
+    else
+        local userfriendly_error = ""
+        if res.code == 7 then
+            -- This is the code for when the server refuses to connect.
+            userfriendly_error = string.format("cURL reports that the server %s refused to connect. Is it running?", construct_url(''))
+        elseif res.code == 22 then
+            userfriendly_error = stirng.format("cURL reports that the server %s returned an error code. Is this the right server?", construct_url(''))
+        end
+        local full_err = string.format(
+            "%s\nFull stderr for process exit code %d:\n%s",
+            userfriendly_error,
+            res.code,
+            res.stderr
+        )
+        wrapped_err_writeln(full_err)
+    end
 end
 
 -- Function to kill the current job
-local kill_job = function(win, signal)
+M.kill = function(win, signal)
     if not signal then
         signal = 'sigterm'
     end
@@ -70,16 +118,17 @@ local on_stdout = function(win, err, data)
     end
 end
 
-local curl_cmd = function(body)
+local completion_curl_cmd = function(body)
     return {
         'curl',
         '--request',
         'POST',
         '--silent',
+        '--fail',
         '--show-error',
         '--no-buffer',
         '--url',
-        'http://localhost:8080/completion',
+        construct_url('completions'),
         '--header',
         'Content-Type: application/json',
         '--header',
@@ -103,12 +152,15 @@ local get_window_generation_context = function(win)
     return table.concat(lines, "\n")
 end
 
-local start_job = function(win)
+M.start = function(win)
     local prompt = get_window_generation_context(win)
-    local curl_body = { prompt = prompt, n_predict = 128, stream = true }
+    local curl_body = { prompt = prompt, n_predict = 128, stream = true, cache_prompt = true }
     local res = vim.system(
-        curl_cmd(curl_body),
-        { stdout=function(data, err) on_stdout(win,data,err) end, text = true },
+        completion_curl_cmd(curl_body),
+        {
+            stdout = function(data, err) on_stdout(win,data,err) end,
+            text = true,
+        },
         function(res) on_exit(win, res) end
     )
     res.data_so_far = ""
@@ -118,9 +170,10 @@ local start_job = function(win)
     return res
 end
 
-local health = function()
+M.health = function()
     -- Ping the /health endpoint to check if the server is running.
-    local res = vim.system({'curl','--silent','--show-error','--fail-with-body','http://localhost:8080/health'}, {text=true}):wait()
+    local url = construct_url('health')
+    local res = vim.system({'curl','--silent','--show-error','--fail-with-body','--url',url}, {text=true}):wait()
     if res.code == 0 then
         return "Server is running: " .. res.stdout
     else
@@ -128,12 +181,12 @@ local health = function()
     end
 end
 
--- Create new commands:
--- :LlamaStart [win] - Start the language model in the current or given window.
--- :LlamaKill [win] - Kill the language model in the current or given window.
--- :LlamaHealth - Check if the language model server is running.
-function setup(opts)
-    local opts = opts or {setup_commands = true, default_keymap = false}
+M.setup = function(opts)
+    if config.is_setup then
+        error("Llama_nvim has already been set up. Reinitializing is not supported.")
+    end
+
+    config = vim.tbl_deep_extend('force', config, M.DEFAULTS, opts or {})
 
     local parse_window_number_or_give_current = function(maybe_win)
         if maybe_win then
@@ -150,43 +203,63 @@ function setup(opts)
     local start_job_impl = function(args)
         local args = args or {}
         local win = parse_window_number_or_give_current(args[1])
-        start_job(win)
+        M.start(win)
     end
     local kill_job_impl = function(args)
         local args = args or {}
         local win = parse_window_number_or_give_current(args[1])
-        kill_job(win)
+        M.kill(win)
     end
     local toggle_job_impl = function(args)
         local args = args or {}
         local win = parse_window_number_or_give_current(args[1])
         if current_jobs[win] and not current_jobs[win].finished then
-            kill_job(win)
+            M.kill(win)
         else
-            start_job(win)
+            M.start(win)
         end
     end
 
-    if opts.setup_commands then
-        vim.api.nvim_create_user_command('LlamaStart', start_job_impl, { nargs = "?" })
-        vim.api.nvim_create_user_command('LlamaKill', kill_job_impl, { nargs = "?" })
-        vim.api.nvim_create_user_command('LlamaHealth', function ()
-            print(health())
-        end, { nargs = 0 })
+    if type(config.commands) == 'table' then
+        if config.commands.start then
+            vim.api.nvim_create_user_command(config.commands.start, start_job_impl, { nargs = "?" })
+        end
+        if config.commands.kill then
+            vim.api.nvim_create_user_command(config.commands.kill, kill_job_impl, { nargs = "?" })
+        end
+        if config.commands.health then
+            vim.api.nvim_create_user_command(config.commands.health, function ()
+                print(M.health())
+            end, { nargs = 0 })
+        end
     end
 
-    if opts.default_keymap then
-        -- Start job doubles as kill job if job is running
-        vim.keymap.set('n', 'gg', toggle_job_impl, { silent = true, unique = true })
-        -- Kill job
-        vim.keymap.set('n', 'G', kill_job_impl, { silent = true, unique = true })
+    if config.keymaps then
+        if config.keymaps.start then
+            -- Start job doubles as kill job if job is running
+            vim.keymap.set('n', config.keymaps.start, toggle_job_impl, { silent = true, unique = true })
+        end
+        if config.keymaps.kill then
+            -- Kill job
+            vim.keymap.set('n', config.keymaps.kill, kill_job_impl, { silent = true, unique = true })
+        end
     end
+
+    return M
 end
 
-return {
-    llama_start = start_job,
-    llama_kill = kill_job,
-    llama_health = health,
-    setup = setup,
+local config_copy_view_metatable = {
+    __index = function(_, key)
+        local res = config[key]
+        if type(res) == 'table' then
+            return vim.deepcopy(res)
+        else
+            return res
+        end
+    end,
 }
+
+M.config = setmetatable({}, config_copy_view_metatable)
+
+return M
 
